@@ -1,0 +1,19 @@
+# data & models
+data/raw/
+data/processed/
+models/
+# results
+results/predictions/
+results/logs/
+# python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+# env
+.env
+# vendor is tracked, but its .git removed
+# ide
+.idea/
+# temp
+empty-tmp/
