@@ -25,6 +25,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     get_linear_schedule_with_warmup,
 )
+import time
+from torch.amp import GradScaler, autocast
 
 _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
@@ -123,13 +125,13 @@ def create_scene_grouped_split(df: pd.DataFrame, test_frac: float = 0.1, seed: i
     return {"train": train_idx, "test": test_idx}
 
 
-def compute_class_weights(labels: np.ndarray, device: torch.device) -> torch.Tensor:
+def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
     """Compute inverse frequency class weights in float32."""
     class_counts = np.bincount(labels, minlength=NUM_LABELS)
     class_counts = np.maximum(class_counts, 1)
     weights = 1.0 / class_counts
     weights = weights / weights.sum() * NUM_LABELS  # Normalize
-    return torch.tensor(weights, dtype=torch.float32, device=device)
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def set_seed(seed: int):
@@ -142,72 +144,63 @@ def set_seed(seed: int):
 
 
 def train_one_seed(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    tokenizer,
-    seed: int,
-    variant: str,
-    input_col: str,
-    epochs: int = DEFAULT_EPOCHS,
-    lr: float = DEFAULT_LR,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    output_dir: Path = None,
+        train_df, test_df, tokenizer, seed, variant, input_col,
+        epochs=DEFAULT_EPOCHS, lr=DEFAULT_LR, batch_size=DEFAULT_BATCH_SIZE,
+        output_dir=None,
 ):
-    """Train model for one seed."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Seed {seed} | Variant {variant}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    use_amp = device.type == "cuda"  # AMP: включаем только на GPU
+    print(f"Device: {device} | AMP: {use_amp}")
 
-    # Apply scene truncation
+    # VRAM monitor
+    if torch.cuda.is_available():
+        print(f"VRAM before model: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
+
+    # Scene truncation
     print("Applying scene truncation...")
     train_df = train_df.copy()
     test_df = test_df.copy()
     train_df["input_truncated"] = train_df[input_col].apply(
-        lambda x: truncate_scene_in_input(x, tokenizer)
-    )
+        lambda x: truncate_scene_in_input(x, tokenizer))
     test_df["input_truncated"] = test_df[input_col].apply(
-        lambda x: truncate_scene_in_input(x, tokenizer)
-    )
+        lambda x: truncate_scene_in_input(x, tokenizer))
 
-    # Create datasets
+    # AMP: num_workers + pin_memory для ускорения DataLoader
     train_dataset = ConditionCheckDataset(train_df, tokenizer, "input_truncated")
     test_dataset = ConditionCheckDataset(test_df, tokenizer, "input_truncated")
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                             num_workers=2, pin_memory=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    # Initialize model
+    # Model (float32 master weights — AMP сам приведёт к fp16 на forward)
     print(f"Loading model {MODEL_NAME}...")
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=NUM_LABELS,
-        torch_dtype=torch.float32,
+        MODEL_NAME, num_labels=NUM_LABELS, torch_dtype=torch.float32,
     ).to(device)
 
-    # Dynamically match class weights dtype to model dtype to prevent CrossEntropyLoss errors
-    model_dtype = next(model.parameters()).dtype
-    print(f"Model dtype: {model_dtype}")
+    if torch.cuda.is_available():
+        print(f"VRAM after model: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
 
-    # Compute class weights (always float32 for stability)
+    # Class weights (всегда float32)
     train_labels = train_df["label_id"].values
-    class_weights = compute_class_weights(train_labels, device)
+    class_weights = compute_class_weights(train_labels).to(device)
     print(f"Class weights: {class_weights.tolist()}")
 
-    # Optimizer and scheduler
+    # Optimizer
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": DEFAULT_WEIGHT_DECAY,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
+        {"params": [p for n, p in model.named_parameters()
+                    if not any(nd in n for nd in no_decay)],
+         "weight_decay": DEFAULT_WEIGHT_DECAY},
+        {"params": [p for n, p in model.named_parameters()
+                    if any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr)
 
@@ -215,10 +208,11 @@ def train_one_seed(
     warmup_steps = int(total_steps * DEFAULT_WARMUP_RATIO)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # Loss function
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    # Training loop
+    # AMP: GradScaler для стабильности fp16
+    scaler = GradScaler("cuda", enabled=use_amp)
+
     print(f"Training for {epochs} epochs ({total_steps} steps)...")
     best_val_f1 = 0.0
     best_model_state = None
@@ -226,52 +220,62 @@ def train_one_seed(
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
+        epoch_start = time.time()  # AMP: замер скорости
 
         for batch in train_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs.logits, labels)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)  # AMP: быстрее, чем zero_grad()
+
+            # AMP: autocast для forward в fp16
+            with autocast("cuda", enabled=use_amp):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs.logits, labels)
+
+            # AMP: scaler.scale + backward + step
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # AMP: защита от NaN
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start
 
-        # Evaluate on test set
+        # VRAM monitor в конце эпохи
+        if torch.cuda.is_available():
+            peak_vram = torch.cuda.max_memory_allocated() / 1e9
+            print(f"  VRAM peak this epoch: {peak_vram:.2f}GB")
+
+        # Evaluation
         model.eval()
-        all_preds = []
-        all_labels = []
-        all_logits = []
-
+        all_preds, all_labels, all_logits = [], [], []
         with torch.no_grad():
             for batch in test_loader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
                 labels = batch["labels"]
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = outputs.logits.cpu()
+                with autocast("cuda", enabled=use_amp):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits.float().cpu()  # AMP: .float() перед переносом на CPU
                 preds = logits.argmax(dim=-1)
 
                 all_preds.extend(preds.numpy())
                 all_labels.extend(labels.numpy())
                 all_logits.extend(logits.numpy())
 
-        # Compute metrics
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        all_logits = np.array(all_logits)
-
+        all_preds, all_labels, all_logits = map(np.array, (all_preds, all_labels, all_logits))
         from sklearn.metrics import f1_score
         macro_f1 = f1_score(all_labels, all_preds, average="macro")
 
-        print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} | Val Macro-F1: {macro_f1:.4f}")
+        print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg_loss:.4f} | "
+              f"Val Macro-F1: {macro_f1:.4f} | Time: {epoch_time:.1f}s")
 
         if macro_f1 > best_val_f1:
             best_val_f1 = macro_f1
