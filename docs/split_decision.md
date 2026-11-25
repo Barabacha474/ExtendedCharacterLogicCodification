@@ -16,7 +16,7 @@ Can the original 90/10 split be recovered from released artifacts?
 ## Decision
 - [ ] Exact split recovered → используем его, фиксируем индексы.
 - [ ] Not recovered → replacement split:
-  - random 90/10, seed=42
+  - random 90/10, seed=43
   - scene-grouped 90/10 (если есть scene id)
   - индексы сохраняются в data/splits/check_scenes_{random,grouped}.json
 
